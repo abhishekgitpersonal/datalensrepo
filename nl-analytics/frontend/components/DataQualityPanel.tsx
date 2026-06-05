@@ -12,15 +12,22 @@ const SEV_STYLES: Record<string, string> = {
 export default function DataQualityPanel({
   sessionId,
   reloadKey,
+  hasTables,
 }: {
   sessionId: string;
   reloadKey: number;
+  hasTables: boolean;
 }) {
   const [report, setReport] = useState<DataQualityReport | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [open, setOpen] = useState(true);
 
   useEffect(() => {
+    if (!hasTables) {
+      setReport({ summary: { errors: 0, warnings: 0, infos: 0 }, issues: [] });
+      setError(null);
+      return;
+    }
     let cancelled = false;
     (async () => {
       try {
@@ -33,7 +40,7 @@ export default function DataQualityPanel({
     return () => {
       cancelled = true;
     };
-  }, [sessionId, reloadKey]);
+  }, [sessionId, reloadKey, hasTables]);
 
   if (error) return <p className="p-3 text-red-600 text-sm">{error}</p>;
   if (!report) return null;
@@ -64,7 +71,12 @@ export default function DataQualityPanel({
               {summary.infos} info
             </span>
           )}
-          {issues.length === 0 && (
+          {!hasTables && (
+            <span className="px-1.5 rounded border bg-slate-100 text-slate-600 border-slate-200">
+              upload data to scan
+            </span>
+          )}
+          {hasTables && issues.length === 0 && (
             <span className="px-1.5 rounded border bg-emerald-100 text-emerald-700 border-emerald-200">
               all clean
             </span>
@@ -72,7 +84,13 @@ export default function DataQualityPanel({
         </span>
       </button>
 
-      {open && issues.length > 0 && (
+      {open && !hasTables && (
+        <p className="mt-2 text-xs text-slate-500">
+          Data quality scan starts after you upload at least one table.
+        </p>
+      )}
+
+      {open && hasTables && issues.length > 0 && (
         <ul className="mt-2 space-y-1 max-h-72 overflow-auto pr-1">
           {issues.map((i, idx) => (
             <IssueRow key={idx} issue={i} />

@@ -76,7 +76,16 @@ export default function AnswerCard({ msg }: { msg: AssistantMessage }) {
       <div className="p-3">
         {tab === "Answer" && (
           <div className="whitespace-pre-wrap text-sm leading-relaxed">
-            {msg.text || (msg.pending ? <span className="text-slate-400">…</span> : <span className="text-slate-500">(no narration)</span>)}
+            {msg.pending && !msg.text ? (
+              <span className="inline-flex items-center gap-2 text-slate-400">
+                <span className="inline-block h-3 w-3 rounded-full border-2 border-slate-400 border-t-transparent animate-spin" />
+                {msg.stage === "narrating" ? "Generating analysis…" : (msg.stage ? `${msg.stage}…` : "thinking…")}
+              </span>
+            ) : msg.text ? (
+              msg.text
+            ) : (
+              <span className="text-slate-500">(no narration)</span>
+            )}
           </div>
         )}
         {tab === "Chart" && hasChart && (

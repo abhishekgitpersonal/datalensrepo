@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "NL Analytics",
-  description: "Ask your CSVs questions in plain English",
+  title: "Data Lens",
+  description: "Data Lens",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

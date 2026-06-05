@@ -62,6 +62,36 @@ CREATE TABLE IF NOT EXISTS data_quality_issues (
 
 CREATE INDEX IF NOT EXISTS idx_dq_session ON data_quality_issues(session_id);
 CREATE INDEX IF NOT EXISTS idx_dq_session_table ON data_quality_issues(session_id, table_name);
+
+CREATE TABLE IF NOT EXISTS semantic_index (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    table_name TEXT NOT NULL,
+    column_name TEXT,
+    data_type TEXT,
+    role TEXT NOT NULL,                 -- dimension | metric | date | identifier
+    tags TEXT,                          -- JSON array of planner/search tags
+    dq_severity TEXT,                   -- max severity seen for this table/column
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_semantic_session ON semantic_index(session_id);
+CREATE INDEX IF NOT EXISTS idx_semantic_session_table ON semantic_index(session_id, table_name);
+
+CREATE TABLE IF NOT EXISTS nl_sql_memory (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    dataset_signature TEXT NOT NULL,
+    question TEXT NOT NULL,
+    sql TEXT NOT NULL,
+    tables_json TEXT,                   -- JSON array of referenced table names
+    success_count INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_used_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(dataset_signature, question, sql)
+);
+
+CREATE INDEX IF NOT EXISTS idx_nl_sql_signature ON nl_sql_memory(dataset_signature);
+CREATE INDEX IF NOT EXISTS idx_nl_sql_last_used ON nl_sql_memory(last_used_at DESC);
 """
 
 

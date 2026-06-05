@@ -153,17 +153,21 @@ export async function* askStream(
   // SSE frames may be separated by either "\n\n" or "\r\n\r\n" depending on
   // the server (sse_starlette uses CRLF). Match both.
   const FRAME_SEP = /\r?\n\r?\n/;
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    let m: RegExpExecArray | null;
-    while ((m = FRAME_SEP.exec(buf)) !== null) {
-      const frame = buf.slice(0, m.index);
-      buf = buf.slice(m.index + m[0].length);
-      const ev = parseFrame(frame);
-      if (ev) yield ev;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let m: RegExpExecArray | null;
+      while ((m = FRAME_SEP.exec(buf)) !== null) {
+        const frame = buf.slice(0, m.index);
+        buf = buf.slice(m.index + m[0].length);
+        const ev = parseFrame(frame);
+        if (ev) yield ev;
+      }
     }
+  } finally {
+    reader.releaseLock();
   }
 }
 

@@ -5,7 +5,7 @@ import logging
 import time
 from typing import AsyncIterator
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from sse_starlette.sse import EventSourceResponse
 
 from .. import db
@@ -13,6 +13,12 @@ from ..config import settings
 from ..core.chart_picker import pick_chart
 from ..core.executor import ExecutionError, dataframe_to_payload, run_sql
 from ..core.profiler import full_schema
+from ..core.semantic_layer import (
+    fetch_similar_sql_examples,
+    plan_schema_for_question,
+    record_successful_sql,
+)
+from ..core.sql_intent_guard import find_intent_violations
 from ..core.sql_validator import (
     SqlValidationError, extract_sql_from_llm_output, validate_and_prepare,
 )
@@ -32,7 +38,7 @@ def _sse(event: str, data) -> dict:
     return {"event": event, "data": json.dumps(data, default=str)}
 
 
-async def _ask_stream(session_id: str, question: str) -> AsyncIterator[dict]:
+async def _ask_stream(session_id: str, question: str, request: Request) -> AsyncIterator[dict]:
     t0 = time.time()
 
     # 1. Persist user message
@@ -72,7 +78,12 @@ async def _ask_stream(session_id: str, question: str) -> AsyncIterator[dict]:
     }
     relationships = schema.get("relationships", [])
 
-    focused_schema = focus_schema_for_question(question, schema)
+    # Query-time planner: narrow schema using semantic index, then apply
+    # existing lexical focus pass for additional prompt compression.
+    plan = plan_schema_for_question(session_id, question, schema)
+    focused_schema = focus_schema_for_question(question, plan["schema"])
+    planner_notes = plan.get("notes", [])
+    few_shot_examples = fetch_similar_sql_examples(schema, question, max_examples=3)
 
     # Pull persisted DQ warnings (top-N severity-ordered) for prompt context.
     dq_rows = db.query(
@@ -88,9 +99,21 @@ async def _ask_stream(session_id: str, question: str) -> AsyncIterator[dict]:
     )
     dq_warnings = [f"[{r['severity']}] {r['message']}" for r in dq_rows]
 
+    async def disconnected() -> bool:
+        return await request.is_disconnected()
+
     # 3. Generate SQL (start with fast model; retries escalate to strong model)
     yield _sse("status", {"stage": "generating_sql", "model": settings.ollama_sql_fast_model})
-    sql_prompt = build_sql_prompt(question, focused_schema, sql_history, dq_warnings=dq_warnings)
+    if await disconnected():
+        return
+    sql_prompt = build_sql_prompt(
+        question,
+        focused_schema,
+        sql_history,
+        dq_warnings=dq_warnings,
+        planner_notes=planner_notes,
+        few_shot_examples=few_shot_examples,
+    )
     try:
         raw = await generate(
             sql_prompt,
@@ -102,6 +125,9 @@ async def _ask_stream(session_id: str, question: str) -> AsyncIterator[dict]:
     except OllamaError as e:
         _persist_error(session_id, str(e))
         yield _sse("error", {"message": f"LLM error: {e}"})
+        return
+
+    if await disconnected():
         return
 
     sql_text = extract_sql_from_llm_output(raw)
@@ -123,27 +149,34 @@ async def _ask_stream(session_id: str, question: str) -> AsyncIterator[dict]:
     )
     MAX_RETRIES = 2  # total of up to 3 attempts (1 initial + 2 retries)
     for attempt in range(MAX_RETRIES + 1):
-        try:
-            safe_sql = validate_and_prepare(
-                last_attempted_sql,
-                allowed_tables,
-                settings.sql_row_limit,
-                table_columns=table_columns,
-                relationships=relationships,
-            )
-        except SqlValidationError as e:
-            last_error = f"validation: {e}"
+        intent_issues = find_intent_violations(question, last_attempted_sql)
+        if intent_issues:
+            last_error = "intent: " + " | ".join(intent_issues)
             safe_sql = None
         else:
-            yield _sse("sql", {"sql": safe_sql})
-            yield _sse("status", {"stage": "executing"})
             try:
-                df = run_sql(session_id, safe_sql)
-                last_error = None
-                break
-            except ExecutionError as e:
-                last_error = f"execution: {e}"
-                df = None
+                safe_sql = validate_and_prepare(
+                    last_attempted_sql,
+                    allowed_tables,
+                    settings.sql_row_limit,
+                    table_columns=table_columns,
+                    relationships=relationships,
+                )
+            except SqlValidationError as e:
+                last_error = f"validation: {e}"
+                safe_sql = None
+            else:
+                if await disconnected():
+                    return
+                yield _sse("sql", {"sql": safe_sql})
+                yield _sse("status", {"stage": "executing"})
+                try:
+                    df = run_sql(session_id, safe_sql)
+                    last_error = None
+                    break
+                except ExecutionError as e:
+                    last_error = f"execution: {e}"
+                    df = None
 
         # Failed. If we still have a retry left, escalate to the strong model.
         if attempt < MAX_RETRIES:
@@ -183,6 +216,8 @@ async def _ask_stream(session_id: str, question: str) -> AsyncIterator[dict]:
                 settings.ollama_sql_model, fixed,
             )
             last_attempted_sql = fixed
+            if await disconnected():
+                return
 
     if df is None or safe_sql is None:
         msg = f"SQL failed after retry: {last_error}"
@@ -190,16 +225,32 @@ async def _ask_stream(session_id: str, question: str) -> AsyncIterator[dict]:
         yield _sse("error", {"message": msg, "sql": last_attempted_sql})
         return
 
+    # Learning loop: store successful NL->SQL pairs by dataset signature
+    # for future few-shot reuse. Non-fatal if persistence fails.
+    try:
+        record_successful_sql(schema, question, safe_sql)
+    except Exception:
+        pass
+
     payload = dataframe_to_payload(df)
+    if await disconnected():
+        return
     yield _sse("result", payload)
 
     # 6. Chart
     chart = pick_chart(df)
     if chart:
+        if await disconnected():
+            return
         yield _sse("chart", chart)
 
-    # 7. Narration (streamed)
+    # 7. Narration — buffer silently, validate, then emit a single verified text event.
+    # This prevents the jarring swap the user sees when streamed text gets replaced
+    # by the deterministic fallback. The "narrating…" status indicator runs while
+    # we buffer, and the final clean answer appears all at once.
     yield _sse("status", {"stage": "narrating"})
+    if await disconnected():
+        return
     narration_prompt = build_narration_prompt(
         question, safe_sql, payload["columns"], payload["rows"], payload["total_rows"],
         dq_warnings=dq_warnings,
@@ -212,10 +263,13 @@ async def _ask_stream(session_id: str, question: str) -> AsyncIterator[dict]:
             system=NARRATE_SYSTEM,
             temperature=0.3,
         ):
+            if await disconnected():
+                return
             chunks.append(tok)
-            yield _sse("text_delta", {"delta": tok})
+            # Do NOT stream text_delta to the client. Buffer silently so the
+            # grounding check can run before the user sees any text, eliminating
+            # the visual swap where good streaming text gets overwritten.
     except OllamaError as e:
-        # Non-fatal: we still have the SQL + table + chart
         yield _sse("warning", {"message": f"Narration failed: {e}"})
 
     narration = "".join(chunks).strip()
@@ -227,24 +281,18 @@ async def _ask_stream(session_id: str, question: str) -> AsyncIterator[dict]:
         payload["total_rows"],
     )
     if (not narration) or (not grounded):
-        reason = "Narration replaced with a grounded summary."
+        if await disconnected():
+            return
         narration = build_deterministic_narration(
             question,
             payload["columns"],
             payload["rows"],
             payload["total_rows"],
         )
-        yield _sse(
-            "text",
-            {
-                "text": narration,
-                "replaced": True,
-                "reason": reason,
-            },
-        )
+        yield _sse("text", {"text": narration, "replaced": True})
     else:
-        # Always emit the final canonical text so the UI doesn't depend on
-        # incremental delta accumulation alone.
+        if await disconnected():
+            return
         yield _sse("text", {"text": narration, "replaced": False})
 
     # 8. Persist assistant message
@@ -281,7 +329,7 @@ def _persist_error(session_id: str, message: str, sql: str | None = None) -> Non
 
 
 @router.post("/{session_id}/ask")
-async def ask(session_id: str, body: AskRequest):
+async def ask(session_id: str, body: AskRequest, request: Request):
     if not db.query("SELECT id FROM sessions WHERE id = ?;", (session_id,)):
         raise HTTPException(404, "Session not found")
-    return EventSourceResponse(_ask_stream(session_id, body.question))
+    return EventSourceResponse(_ask_stream(session_id, body.question, request))

@@ -62,7 +62,11 @@ export default function SessionPage() {
               error={schemaError}
               onChanged={() => setReloadKey((k) => k + 1)}
             />
-            <DataQualityPanel sessionId={sessionId} reloadKey={reloadKey} />
+            <DataQualityPanel
+              sessionId={sessionId}
+              reloadKey={reloadKey}
+              hasTables={(schema?.tables.length ?? 0) > 0}
+            />
           </div>
         </aside>
 

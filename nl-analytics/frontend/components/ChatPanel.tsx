@@ -23,6 +23,7 @@ export default function ChatPanel({
   const inFlightRef = useRef(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const stopRequestedRef = useRef(false);
 
   // Load history on mount / when session changes
   useEffect(() => {
@@ -69,6 +70,7 @@ export default function ChatPanel({
 
     const ac = new AbortController();
     abortRef.current = ac;
+    stopRequestedRef.current = false;
     try {
       for await (const ev of askStream(sessionId, q, ac.signal)) {
         setThread((t) =>
@@ -101,9 +103,6 @@ export default function ChatPanel({
                 // Final, grounded narration from the backend. Always overwrites
                 // any streamed text so hallucinated tokens get corrected.
                 m.text = ev.data.text || "";
-                if (ev.data.replaced && ev.data.reason) {
-                  m.text = m.text + `\n\n_Note: ${ev.data.reason}_`;
-                }
                 break;
               case "warning":
                 m.text = (m.text || "") + `\n\n(${ev.data.message})`;
@@ -126,6 +125,24 @@ export default function ChatPanel({
         if (ev.event === "done" || ev.event === "error") break;
       }
     } catch (e: any) {
+      if (e?.name === "AbortError" || stopRequestedRef.current) {
+        setThread((t) =>
+          t.map((item) =>
+            item.kind === "assistant" && item.id === tempAssistantId
+              ? {
+                  ...item,
+                  msg: {
+                    ...item.msg,
+                    pending: false,
+                    stage: null,
+                    text: item.msg.text ? `${item.msg.text}\n\nStopped.` : "Stopped.",
+                  },
+                }
+              : item,
+          ),
+        );
+        return;
+      }
       setThread((t) =>
         t.map((item) =>
           item.kind === "assistant" && item.id === tempAssistantId
@@ -136,8 +153,18 @@ export default function ChatPanel({
     } finally {
       setBusy(false);
       abortRef.current = null;
+      stopRequestedRef.current = false;
       inFlightRef.current = false;
     }
+  }
+
+  function stopAsk() {
+    if (!abortRef.current) return;
+    stopRequestedRef.current = true;
+    abortRef.current.abort();
+    abortRef.current = null;
+    setBusy(false);
+    inFlightRef.current = false;
   }
 
   return (
@@ -173,7 +200,7 @@ export default function ChatPanel({
           onChange={(e) => setInput(e.target.value)}
           placeholder={hasTables ? "Ask a question…" : "Upload CSVs first"}
           className="flex-1 border rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-400"
-          disabled={!hasTables || busy}
+          disabled={!hasTables}
         />
         <button
           type="submit"
@@ -181,6 +208,14 @@ export default function ChatPanel({
           className="px-4 py-2 bg-slate-900 text-white rounded-md disabled:opacity-40 text-sm"
         >
           {busy ? "…" : "Ask"}
+        </button>
+        <button
+          type="button"
+          onClick={stopAsk}
+          disabled={!busy}
+          className="px-4 py-2 border border-slate-300 text-slate-700 rounded-md disabled:opacity-40 text-sm"
+        >
+          Stop
         </button>
       </form>
     </div>

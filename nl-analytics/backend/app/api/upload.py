@@ -8,6 +8,7 @@ from fastapi import APIRouter, File, HTTPException, UploadFile
 from .. import db
 from ..config import settings
 from ..core.data_quality import scan_session
+from ..core.semantic_layer import rebuild_semantic_index
 from ..core.session_manager import (
     safe_table_name, session_dir, load_csv_into_duckdb,
 )
@@ -116,10 +117,12 @@ async def upload(session_id: str, files: list[UploadFile] = File(...)) -> dict:
         (session_id,),
     )
     dq_report = _refresh_data_quality(session_id)
+    semantic_summary = rebuild_semantic_index(session_id, dq_report)
     return {
         "uploaded": uploaded,
         "skipped": skipped,
         "data_quality": dq_report.get("summary", {}),
+        "semantic_index": semantic_summary,
     }
 
 
@@ -150,7 +153,8 @@ def delete_file(session_id: str, table_name: str) -> dict:
     )
     # Rescan to drop any DQ entries that referenced this table.
     try:
-        _refresh_data_quality(session_id)
+        report = _refresh_data_quality(session_id)
+        rebuild_semantic_index(session_id, report)
     except Exception:
         # Non-fatal: deletion succeeded even if scan can't run on empty session.
         pass

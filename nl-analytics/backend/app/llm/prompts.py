@@ -21,29 +21,39 @@ You must:
     - Do NOT use DATE_PART('day', date_col) to represent weekday (that is day-of-month).
     - For month-level grouping, use DATE_TRUNC('month', date_col) and keep year context.
     - For delays, use DATE_DIFF('day', start_date, end_date) with the exact date columns asked.
+    - For "latest" / "most recent" month questions on historical data, derive recency from the data (e.g., MAX(date_col)), not CURRENT_DATE.
+- Aggregation correctness rules:
+    - If counting orders while joining line-item/detail tables, use COUNT(DISTINCT order_id) to avoid overcounting.
+    - For concentration/share questions, compute individual share as value / SUM(value) OVER (); do NOT use cumulative running percentage unless explicitly asked.
+    - For seasonal patterns by quarter, prefer grouping by quarter number (EXTRACT(quarter FROM date_col)); include year only when explicitly requested.
+    - For generic revenue/sales questions, prefer sales-side metrics such as orders.total_price or item revenue (quantity * price_at_purchase). Do NOT use payment.amount unless the question explicitly asks about payments, transactions, or payment methods.
 - If the question is ambiguous, make a reasonable assumption and proceed.
 - Return ONLY a JSON object: {"sql": "<the query>", "assumptions": "<brief notes or empty>"}.
 No prose outside that JSON.
 """
 
-NARRATE_SYSTEM = """You are a concise data analyst. Given a user question and the result table,
-write a plain-English response with three sections in this exact order:
+NARRATE_SYSTEM = """You are a skilled data analyst giving clear, grounded answers.
+Given a user question and the result table, write a plain-English response with
+three sections in this exact order:
 
-1) Explanation: 2-4 sentences directly answering the question as if you were
-   chatting with the user. Walk through the top rows in words (names + values)
-   and what the ranking means. Do not describe SQL or how the answer was
-   computed.
+1) Explanation: Directly answer the question conversationally. For simple
+   ranking/lookup questions, 2-3 sentences is enough. For analytical questions
+   about trends, distributions, comparisons, or time-series, go as deep as the
+   data allows — identify patterns, note high/low points, describe movement
+   over time, and give meaningful context. There is no sentence limit for complex
+   analysis.
 2) Summary: a single short line restating the headline answer.
-3) Insights: 2-4 short bullets with comparisons (top vs runner-up, gaps,
-   percentages already visible in the table).
+3) Insights: 2-5 bullets (more for complex/analytical questions) with concrete
+   comparisons, gaps, percentages, or trends visible in the table.
 
 Rules:
 - Use exact values from the table. Do not invent numbers or names.
-- Do not repeat the entire table. If the result is empty, say so in the
-  Explanation and skip the rest.
-- Do NOT mention SQL, LIMIT clauses, row caps, or query syntax.
-- Hard rule: every numeric value you mention must appear exactly in the
-  provided result table or the explicit total row count in the prompt.
+- Do not repeat the entire table row-by-row.
+- If the result is empty, say so and skip the rest.
+- Do not start the Explanation with templated stock phrases.
+- Do NOT mention SQL, LIMIT clauses, row counts, or query mechanics.
+- Hard rule: every numeric value you mention must appear exactly in the visible
+  result table or in the total row count stated in the prompt.
 """
 
 
@@ -52,6 +62,8 @@ def build_sql_prompt(
     schema: dict[str, Any],
     history: list[dict[str, Any]],
     dq_warnings: list[str] | None = None,
+    planner_notes: list[str] | None = None,
+    few_shot_examples: list[dict[str, str]] | None = None,
 ) -> str:
     tables = schema.get("tables", [])
     rels = schema.get("relationships", [])
@@ -85,6 +97,22 @@ def build_sql_prompt(
         parts.append("\n# Date/Time hints for this question")
         for hint in hints:
             parts.append(f"- {hint}")
+
+    if planner_notes:
+        parts.append("\n# Planner context (relevant tables/columns)")
+        for note in planner_notes[:8]:
+            parts.append(f"- {note}")
+
+    if few_shot_examples:
+        parts.append("\n# Previously successful NL->SQL examples for this dataset")
+        parts.append("Use these patterns when relevant, but adapt to the current question and schema.")
+        for ex in few_shot_examples[:3]:
+            q = (ex.get("question") or "").strip()
+            s = (ex.get("sql") or "").strip()
+            if not q or not s:
+                continue
+            parts.append(f"Q: {q}")
+            parts.append(f"SQL: {s}")
 
     if history:
         parts.append("\n# Conversation so far")
@@ -283,17 +311,35 @@ def build_narration_prompt(
             "If the question is sensitive to any of the above issues, mention "
             "the caveat briefly in the summary so the reader knows the limit."
         )
+    # Detect whether the question calls for deep analysis or a quick answer.
+    is_analytical = bool(re.search(
+        r"trend|over time|month|year|quarter|weekly|daily|annual|histor"
+        r"|compare|breakdown|analysis|analyz|distribut|correlat|pattern"
+        r"|fluctuat|growth|decline|forecast|period|detail|explain|performance"
+        r"|insight|why|how (much|many|often)|movement",
+        question.lower(),
+    ))
+    depth_instruction = (
+        "For this analytical question, go deep: identify patterns, trends, "
+        "peaks, troughs, and meaningful comparisons across the full visible "
+        "result set. Do not artificially limit the length."
+        if is_analytical
+        else "Keep the explanation focused and concise."
+    )
     lines.append(
         "\nWrite the response in this EXACT format:\n"
-        "Explanation: <2-4 sentences answering the question conversationally, "
-        "naming the top entities and their values from the table>\n\n"
-        "Summary: <one line restating the headline answer>\n\n"
-        "Insights:\n- <insight 1 with numbers>\n- <insight 2 with numbers>\n\n"
-        "Use trend/category comparisons when present. Do not mention SQL or row limits.\n"
+        "Explanation: <detailed answer; explain trends/comparisons rather than listing rows>\n\n"
+        "Summary: <one-line headline that does NOT repeat the Explanation verbatim>\n\n"
+        "Insights:\n- <non-duplicative insight 1 with concrete values or deltas>\n- <non-duplicative insight 2 with concrete values or deltas>\n\n"
+        + depth_instruction + "\n"
         "STRICT GROUNDING RULES:\n"
         "- Only mention values that appear exactly in the visible table above or in the total row count.\n"
         "- Do not aggregate across rows unless the aggregate value itself appears in the table.\n"
-        "- Do not collapse entities (e.g., combine multiple customers into first-name groups)."
+        "- Do not collapse entities (e.g., combine multiple customers into first-name groups).\n"
+        "SECTION QUALITY RULES:\n"
+        "- Explanation should be the longest section for analytical questions.\n"
+        "- Summary should be one concise headline sentence only.\n"
+        "- Insights must add new observations (extremes, direction changes, gaps, or concentration), not restate the same sentence."
     )
     return "\n".join(lines)
 
@@ -349,23 +395,22 @@ def narration_is_grounded(
     rows: list[list[Any]],
     total_rows: int,
 ) -> bool:
-    # Check 1: Validate all numbers in narration exist in result or total_rows
+    """Verify every number the narration mentions exists in the actual result.
+
+    Only numeric values are checked — they are deterministic and safe to
+    validate. Entity-name checks were removed because multi-word names,
+    partial mentions, and paraphrases cause too many false positives that
+    replace correct LLM narration with the worse deterministic fallback.
+    """
+    if not text:
+        return False
     allowed_numbers = _allowed_number_literals(question, rows, total_rows)
-    found = NUMBER_RE.findall(text or "")
-    for token in found:
+    for token in NUMBER_RE.findall(text):
         canonical = _canonical_number(token)
         if canonical is None:
             continue
         if canonical not in allowed_numbers:
             return False
-    
-    # Check 2: Validate entity names (product names, customer names, etc.)
-    # Extract all non-numeric string values from result rows.
-    # If narration mentions a name not in the result, it's hallucinating.
-    allowed_entities = _allowed_entity_names(rows, columns)
-    if not _narration_entity_names_valid(text, allowed_entities):
-        return False
-    
     return True
 
 
@@ -471,9 +516,7 @@ def build_deterministic_narration(
         )
 
     cols = list(columns)
-    show_cols = cols[: min(4, len(cols))]
     visible = len(rows)
-    top_n = min(5, visible)
 
     def _to_text(value: Any) -> str:
         return "NULL" if value is None else str(value)
@@ -488,10 +531,105 @@ def build_deterministic_narration(
     def _pretty_col(col: str) -> str:
         return col.replace("_", " ")
 
+    def _as_float(value: Any) -> float | None:
+        try:
+            if value is None:
+                return None
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _looks_time_like_column(name: str, values: list[Any]) -> bool:
+        lower = name.lower()
+        if any(k in lower for k in ["date", "month", "year", "time", "period"]):
+            return True
+        sample = [v for v in values[:5] if v is not None]
+        if not sample:
+            return False
+        try:
+            parsed = pd.to_datetime([str(v) for v in sample], errors="coerce")
+            return bool(parsed.notna().all())
+        except Exception:
+            return False
+
+    # Time-series path: one time-like column and at least one numeric metric.
+    time_idx = -1
+    for i, col in enumerate(cols):
+        series = [r[i] if i < len(r) else None for r in rows]
+        if _looks_time_like_column(col, series):
+            time_idx = i
+            break
+
+    numeric_indices = [
+        i for i, _c in enumerate(cols)
+        if any(_looks_numeric(r[i]) for r in rows if i < len(r) and r[i] is not None)
+    ]
+
+    if time_idx >= 0 and numeric_indices:
+        metric_idx = numeric_indices[0] if numeric_indices[0] != time_idx else (numeric_indices[1] if len(numeric_indices) > 1 else -1)
+        if metric_idx >= 0:
+            points: list[tuple[str, float]] = []
+            for row in rows:
+                if time_idx >= len(row) or metric_idx >= len(row):
+                    continue
+                x = row[time_idx]
+                y = _as_float(row[metric_idx])
+                if x is None or y is None:
+                    continue
+                points.append((str(x), y))
+
+            if len(points) >= 2:
+                start_label, start_val = points[0]
+                end_label, end_val = points[-1]
+                peak_label, peak_val = max(points, key=lambda p: p[1])
+                low_label, low_val = min(points, key=lambda p: p[1])
+                delta = end_val - start_val
+                pct = (delta / start_val * 100.0) if start_val != 0 else None
+                direction = "increased" if delta > 0 else ("decreased" if delta < 0 else "was flat")
+
+                explanation = (
+                    f"Explanation: Month-by-month, {_pretty_col(cols[metric_idx])} starts at {start_val} in {start_label} "
+                    f"and ends at {end_val} in {end_label}. Overall it {direction} by {abs(delta)}"
+                )
+                if pct is not None:
+                    explanation += f" ({pct:.2f}%)."
+                else:
+                    explanation += "."
+                explanation += (
+                    f" The highest month is {peak_label} at {peak_val}, while the lowest month is {low_label} at {low_val}."
+                )
+
+                summary_line = (
+                    f"Summary: {_pretty_col(cols[metric_idx]).capitalize()} {direction} from {start_label} to {end_label}, "
+                    f"peaking at {peak_val} in {peak_label}."
+                )
+
+                insights: list[str] = [
+                    f"- Net change across the period: {delta} ({pct:.2f}% if start is non-zero)." if pct is not None else f"- Net change across the period: {delta}.",
+                    f"- Peak-to-trough spread is {peak_val - low_val} ({peak_label} vs {low_label}).",
+                ]
+
+                # Add largest month-over-month movement when possible.
+                mom_changes: list[tuple[str, float]] = []
+                for i in range(1, len(points)):
+                    prev_label, prev_val = points[i - 1]
+                    curr_label, curr_val = points[i]
+                    mom_changes.append((f"{prev_label} -> {curr_label}", curr_val - prev_val))
+                if mom_changes:
+                    jump_label, jump_val = max(mom_changes, key=lambda p: p[1])
+                    drop_label, drop_val = min(mom_changes, key=lambda p: p[1])
+                    insights.append(f"- Largest month-over-month increase: {jump_label} ({jump_val}).")
+                    if drop_val < 0:
+                        insights.append(f"- Largest month-over-month decline: {drop_label} ({drop_val}).")
+
+                return explanation + "\n\n" + summary_line + "\n\nInsights:\n" + "\n".join(insights)
+
+    # Generic non-time-series fallback.
+    show_cols = cols[: min(4, len(cols))]
+    top_n = min(5, visible)
     name_like_idx = [i for i, c in enumerate(show_cols) if "name" in c.lower()]
 
     def _entity_label(row: list[Any]) -> str:
-        # Prefer name-like columns for readable entity labels.
         if name_like_idx:
             parts = []
             for i in name_like_idx[:2]:
@@ -499,7 +637,6 @@ def build_deterministic_narration(
                     parts.append(str(row[i]))
             if parts:
                 return " ".join(parts)
-
         for i, _ in enumerate(show_cols):
             if i < len(row) and row[i] is not None and not _looks_numeric(row[i]):
                 return str(row[i])
@@ -522,37 +659,25 @@ def build_deterministic_narration(
         row = rows[idx]
         entity = _entity_label(row)
         metrics = _metric_pairs(row)
-        if metrics:
-            top_mentions.append(f"{entity} ({', '.join(metrics[:2])})")
-        else:
-            top_mentions.append(entity)
+        top_mentions.append(f"{entity} ({', '.join(metrics[:2])})" if metrics else entity)
 
     explanation = (
-        f"Explanation: Here are the top {top_n} results for your question, "
-        f"ranked by the returned query output: {', '.join(top_mentions)}."
+        f"Explanation: The result is led by {top_mentions[0]}"
+        + (f", followed by {top_mentions[1]}." if len(top_mentions) > 1 else ".")
     )
     if total_rows > top_n:
-        explanation += f" The full result contains {total_rows} rows in total."
-    else:
-        explanation += " These rows cover the complete result set."
+        explanation += f" This preview shows the first {top_n} rows out of {total_rows} total."
 
-    summary_line = f"Summary: Top {top_n} results are {', '.join(top_mentions)}."
+    summary_line = f"Summary: {top_mentions[0]} is the top result in the current output."
 
-    insights = [f"- The answer currently shows {visible} row(s) out of {total_rows} total row(s)."]
-    if visible >= 2:
-        first_label = _entity_label(rows[0])
-        second_label = _entity_label(rows[1])
-        insights.append(f"- The ranking starts with {first_label}, followed by {second_label}.")
+    insights = [
+        f"- Visible rows: {visible} out of {total_rows} total.",
+        f"- Top entries in order: {', '.join(top_mentions[: min(3, len(top_mentions))])}.",
+    ]
     if total_rows > visible:
-        insights.append("- More rows are available beyond the visible preview.")
+        insights.append("- Additional rows exist beyond the visible preview and may change deeper ranking context.")
 
-    return (
-        explanation
-        + "\n\n"
-        + summary_line
-        + "\n\nInsights:\n"
-        + "\n".join(insights)
-    )
+    return explanation + "\n\n" + summary_line + "\n\nInsights:\n" + "\n".join(insights)
 
 
 def _allowed_number_literals(question: str, rows: list[list[Any]], total_rows: int) -> set[str]:
