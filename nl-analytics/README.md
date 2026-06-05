@@ -1,3 +1,6 @@
+# Demo video drive link
+https://drive.google.com/drive/folders/15uO9WEQdj_fa29jDpMfulLYhGImlXFqp
+
 # NL Analytics Platform
 
 A local, end-to-end natural language analytics platform that converts plain-English questions into SQL, executes safely on tabular data, and returns grounded answers with charts.
@@ -164,15 +167,3 @@ Open the UI at http://localhost:3000 (or next available port shown by Next.js).
 4. Role-based access and authentication for multi-user deployment.
 5. Support for additional connectors beyond CSV.
 
-## Screenshots (Placeholders)
-1. Upload and session creation screen.
-2. Natural language query and SQL preview.
-3. Result table and chart visualization.
-4. Grounded narration output panel.
-
-Add screenshots under a dedicated assets directory and replace these placeholders with image links.
-
-## Repository Cleanup Notes
-1. Removed temporary/debug artifacts from the repository root.
-2. Consolidated project documentation into this README.
-3. Added root environment template for easier onboarding.
